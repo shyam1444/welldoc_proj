@@ -1,0 +1,113 @@
+import gradio as gr
+import requests
+import fitz  # PyMuPDF for reading PDF
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from concurrent.futures import ThreadPoolExecutor
+import re
+
+class RAGChat:
+    def _init_(self):
+        self.vectorstore = None
+        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.guidelines = ""  # Store extracted guidelines
+
+    def detect_language(self, code):
+        if re.search(r'class\s+\w+\s*{', code) or 'System.out.println' in code:
+            return "Java"
+        elif re.search(r'namespace\s+\w+', code) or 'Console.WriteLine' in code:
+            return "C#"
+        return "Unknown"
+
+    def process_pdf(self, pdf_file):
+        if pdf_file is None:
+            return "No file uploaded. Please upload a PDF file."
+    
+        try:
+            loader = PyMuPDFLoader(pdf_file.name)
+            documents = loader.load()
+
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+        
+            def process_page(doc):
+                return text_splitter.split_documents([doc])
+
+            with ThreadPoolExecutor() as executor:
+                texts = list(executor.map(process_page, documents))
+            texts = [text for sublist in texts for text in sublist]
+
+            self.vectorstore = FAISS.from_documents(texts, self.embeddings)
+            self.guidelines = "\n".join([doc.page_content for doc in texts])  # Store extracted guidelines
+
+            return "PDF processed successfully! Guidelines extracted."
+    
+        except Exception as e:
+            return f"Error processing PDF: {str(e)}"
+
+
+    def get_relevant_context(self, query, k=3):
+        if not self.vectorstore:
+            return ""
+        docs = self.vectorstore.similarity_search(query, k=k)
+        return "\n".join(doc.page_content for doc in docs)
+
+    def chat(self, message, history):
+        messages = []
+        if history:
+            for user_msg, assistant_msg in history:
+                messages.append({"role": "user", "content": user_msg})
+                messages.append({"role": "assistant", "content": assistant_msg})
+
+        context = self.get_relevant_context(message)
+        prompt = f"""Context from PDF:\n{context}\n\nUser question:\n{message}\n\nBased on the context, please answer the question. If the context doesn't contain relevant info, mention that."""        
+        
+        messages.append({"role": "user", "content": prompt})
+
+        response = requests.post(
+            'http://localhost:11434/api/chat',
+            json={"model": "codellama", "messages": messages, "stream": False}
+        )
+        return response.json().get('message', {}).get('content', "Error in response.")
+
+    def validate_code(self, code):
+        if not self.guidelines:
+            return "No guidelines have been processed yet. Please upload a PDF first."
+
+        language = self.detect_language(code)
+        if language == "Unknown":
+            return "Could not detect language. Please provide Java or C# code."
+
+        prompt = f"""Guidelines:\n{self.guidelines}\n\nDetected Language: {language}\n\nUser Code:\n{code}\n\n
+        Analyze the code against the provided guidelines. Identify violations, suggest improvements, 
+        check if unit tests are implemented according to best practices (AAA pattern, mocking dependencies, 
+        exception handling, and edge cases), and provide a corrected version following best practices."""
+
+        response = requests.post(
+            'http://localhost:11434/api/chat',
+            json={"model": "codellama", "messages": [{"role": "user", "content": prompt}], "stream": False}
+        )   
+        return response.json().get('message', {}).get('content', "Error in validation.")
+
+rag_chat = RAGChat()
+
+with gr.Blocks() as demo:
+    gr.Markdown("# AI Visionaries Code Guidelines Analyzer and Correction System")
+
+    with gr.Row():
+        pdf_input = gr.File(label="Upload Guidelines PDF", file_types=[".pdf"])
+        process_button = gr.Button("Process Guidelines")
+        code_input = gr.Textbox(label="Paste Code Here", placeholder="Enter your code snippet")
+        validate_button = gr.Button("Enter")
+    
+    status_text = gr.Textbox(label="Status", interactive=False)
+    chatbot = gr.ChatInterface(fn=rag_chat.chat, title="Ask Questions", 
+                           description="Ask questions about the guidelines if doubts persist.", 
+                           type="messages")
+
+    process_button.click(fn=rag_chat.process_pdf, inputs=[pdf_input], outputs=[status_text])
+    validate_button.click(fn=rag_chat.validate_code, inputs=[code_input], outputs=[status_text])
+
+if _name_ == "_main_":
+    demo.launch(share=True)
